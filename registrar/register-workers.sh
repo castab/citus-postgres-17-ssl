@@ -97,15 +97,44 @@ discovered_workers=()
 
 # Method 1: Try common worker names (worker1-20)
 echo "Scanning for worker services..."
+echo "DEBUG: Testing DNS resolution for worker services..."
 for i in {1..20}; do
     worker_name="worker$i"
     
-    # Check if the hostname resolves (DNS lookup)
-    if host "$worker_name" >/dev/null 2>&1; then
-        echo "✓ Discovered: $worker_name"
+    # Verbose DNS check
+    echo "  Checking: $worker_name"
+    if host "$worker_name" 2>&1; then
+        echo "✓ Discovered: $worker_name (DNS resolved)"
         discovered_workers+=("$worker_name")
+    else
+        echo "  ✗ $worker_name - DNS lookup failed"
     fi
 done
+
+echo ""
+echo "DEBUG: Also checking Railway internal DNS format..."
+for i in {1..20}; do
+    worker_name="worker$i.railway.internal"
+    
+    echo "  Checking: $worker_name"
+    if host "$worker_name" 2>&1; then
+        # Strip .railway.internal for connection
+        clean_name="worker$i"
+        if [[ ! " ${discovered_workers[@]} " =~ " ${clean_name} " ]]; then
+            echo "✓ Discovered: $clean_name (via .railway.internal)"
+            discovered_workers+=("$clean_name")
+        fi
+    fi
+done
+
+echo ""
+echo "DEBUG: Checking Railway environment variables..."
+env | grep -i railway | grep -i worker || echo "  No Railway worker variables found"
+
+echo ""
+echo "DEBUG: Attempting to list all resolvable hosts in private network..."
+# This might reveal the actual hostname format Railway is using
+getent hosts | grep -i worker || echo "  No worker hosts found in DNS"
 
 # Method 2: Also check for workers with different naming patterns
 # (e.g., worker-1, citus-worker-1, etc.)
