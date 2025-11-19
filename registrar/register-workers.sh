@@ -10,8 +10,6 @@ echo "all worker nodes with the coordinator."
 echo ""
 echo "Supported naming patterns:"
 echo "  - worker1, worker2, worker3, ..."
-echo "  - worker-1, worker-2, worker-3, ..."
-echo "  - citus-worker1, citus-worker-1, etc."
 echo ""
 echo "To manually re-run registration after adding workers:"
 echo "  Railway Dashboard → registrar service → Deploy"
@@ -19,73 +17,108 @@ echo ""
 echo "========================================="
 echo ""
 
-# Wait for coordinator to be ready
+# -------------------------------------------------------------
+# Safety Wrappers (like try/catch for bash)
+# -------------------------------------------------------------
+
+safe_getent() {
+    # Returns 0 only if hostname resolves
+    getent hosts "$1" >/dev/null 2>&1 || return 1
+}
+
+safe_host() {
+    # host(1) often returns NOTIMP but output still contains usable IPs
+    local out
+    out=$(host "$1" 2>&1 || true)
+    echo "$out"
+}
+
+safe_nc() {
+    # nc should never break the script
+    nc -z -w5 "$1" "$2" >/dev/null 2>&1 || return 1
+}
+
+safe_psql() {
+    # psql check without breaking script
+    PGPASSWORD=$POSTGRES_PASSWORD psql \
+        -h "$1" -U "$POSTGRES_USER" -d postgres \
+        -c '\q' >/dev/null 2>&1 || return 1
+}
+
+# -------------------------------------------------------------
+# Wait for coordinator
+# -------------------------------------------------------------
 echo "Waiting for coordinator to be ready..."
-until PGPASSWORD=$POSTGRES_PASSWORD psql -h "$COORDINATOR_HOST" -U "$POSTGRES_USER" -d postgres -c '\q' 2>/dev/null; do
+until safe_psql "$COORDINATOR_HOST"; do
     echo "Coordinator not ready yet, waiting..."
     sleep 5
 done
-echo "✓ Coordinator is ready"
+echo "✓ Coordinator is ready!"
 
-# Function to wait for a worker to be ready
+
+# -------------------------------------------------------------
+# Wait for worker
+# -------------------------------------------------------------
 wait_for_worker() {
     local worker_host=$1
     local max_attempts=30
     local attempt=0
-    
-    # Always append .railway.internal for Railway's private network
     local full_host="${worker_host}.railway.internal"
-    
+
     echo "Waiting for $full_host to be ready..."
-    
-    # Test with netcat first
-    until nc -z -w5 "$full_host" 5432 2>/dev/null; do
-        attempt=$((attempt + 1))
+
+    # 1. Wait for TCP port
+    until safe_nc "$full_host" 5432; do
+        attempt=$(( attempt + 1 ))
         if [ $attempt -ge $max_attempts ]; then
             echo "✗ Timeout waiting for $full_host"
             return 1
         fi
-        echo "  $full_host not ready yet (attempt $attempt/$max_attempts)..."
+        echo "  $full_host not ready (attempt $attempt/$max_attempts)"
         sleep 5
     done
-    
-    # Additional check with psql
-    until PGPASSWORD=$POSTGRES_PASSWORD psql -h "$full_host" -U "$POSTGRES_USER" -d postgres -c '\q' 2>/dev/null; do
-        attempt=$((attempt + 1))
+
+    # 2. Wait for PostgreSQL
+    until safe_psql "$full_host"; do
+        attempt=$(( attempt + 1 ))
         if [ $attempt -ge $max_attempts ]; then
             echo "✗ Timeout waiting for $full_host PostgreSQL"
             return 1
         fi
         sleep 2
     done
-    
+
     echo "✓ $full_host is ready"
     return 0
 }
 
-# Function to register a worker
+
+# -------------------------------------------------------------
+# Register worker
+# -------------------------------------------------------------
 register_worker() {
     local worker_host=$1
-    local worker_port=${2:-5432}
-    
-    # Always use .railway.internal suffix for Railway
+    local port=${2:-5432}
     local full_host="${worker_host}.railway.internal"
-    
+
     echo ""
-    echo "Registering worker: $full_host:$worker_port"
-    
-    # Check if worker is already registered
-    local existing=$(PGPASSWORD=$POSTGRES_PASSWORD psql -h "$COORDINATOR_HOST" -U "$POSTGRES_USER" -d postgres -tA -c \
-        "SELECT COUNT(*) FROM pg_dist_node WHERE nodename = '$full_host' AND nodeport = $worker_port;")
-    
+    echo "Registering worker: $full_host:$port"
+
+    # Check existing
+    local existing
+    existing=$(PGPASSWORD=$POSTGRES_PASSWORD psql \
+        -h "$COORDINATOR_HOST" -U "$POSTGRES_USER" -d postgres -tA -c \
+        "SELECT COUNT(*) FROM pg_dist_node WHERE nodename = '$full_host' AND nodeport = $port;" || echo "0")
+
     if [ "$existing" != "0" ]; then
-        echo "✓ Worker $full_host already registered, skipping"
+        echo "✓ Worker already registered, skipping"
         return 0
     fi
-    
-    # Register the worker
-    if PGPASSWORD=$POSTGRES_PASSWORD psql -h "$COORDINATOR_HOST" -U "$POSTGRES_USER" -d postgres -c \
-        "SELECT * FROM citus_add_node('$full_host', $worker_port);" >/dev/null 2>&1; then
+
+    # Try registration
+    if PGPASSWORD=$POSTGRES_PASSWORD psql \
+        -h "$COORDINATOR_HOST" -U "$POSTGRES_USER" -d postgres -c \
+        "SELECT * FROM citus_add_node('$full_host', $port);" >/dev/null 2>&1; then
         echo "✓ Successfully registered worker: $full_host"
         return 0
     else
@@ -94,81 +127,82 @@ register_worker() {
     fi
 }
 
-# Discover and register workers using Railway's private network DNS
-# Railway services are accessible via their service name on the private network
+
+# -------------------------------------------------------------
+# Discover workers
+# -------------------------------------------------------------
 echo ""
 echo "Discovering workers on Railway private network..."
-
-# Dynamic worker discovery - finds any service named "worker*"
-# This allows users to add worker3, worker4, etc. after deployment
 discovered_workers=()
 
-# Method 1: Try common worker names (worker1-20)
 echo "Scanning for worker services..."
-echo "DEBUG: Testing DNS resolution for worker services..."
 
 for i in {1..20}; do
     worker_name="worker$i"
-    
-    # Check both formats: with and without .railway.internal
+    full_host="${worker_name}.railway.internal"
+
     echo "  Checking: $worker_name"
-    
-    # Try with .railway.internal first (more reliable on Railway)
-    if getent hosts "${worker_name}.railway.internal" >/dev/null 2>&1; then
-        echo "✓ Discovered: $worker_name (via getent hosts)"
+
+    # 1. Try getent with suffix first
+    if safe_getent "$full_host"; then
+        echo "✓ Discovered: $worker_name (getent .railway.internal)"
         discovered_workers+=("$worker_name")
         continue
     fi
-    
-    # Try without suffix
-    if getent hosts "$worker_name" >/dev/null 2>&1; then
-        echo "✓ Discovered: $worker_name (direct)"
+
+    # 2. Try direct hostname
+    if safe_getent "$worker_name"; then
+        echo "✓ Discovered: $worker_name (getent direct)"
         discovered_workers+=("$worker_name")
         continue
     fi
-    
-    # Fallback: Try parsing host output even if exit code is non-zero
-    # Railway DNS sometimes returns addresses but with NOTIMP error code
-    host_output=$(host "${worker_name}.railway.internal" 2>&1)
-    if echo "$host_output" | grep -q "has address\|has IPv6 address"; then
-        echo "✓ Discovered: $worker_name (via host command with address)"
+
+    # 3. Parse host output
+    host_output=$(safe_host "$full_host")
+    if echo "$host_output" | grep -Eq "has address|has IPv6 address"; then
+        echo "✓ Discovered: $worker_name (via host output)"
         discovered_workers+=("$worker_name")
         continue
     fi
 done
 
 echo ""
-echo "DEBUG: Discovered workers array: ${discovered_workers[@]}"
+echo "DEBUG: Discovered workers: ${discovered_workers[@]}"
 
-# Register all discovered workers
+
+# -------------------------------------------------------------
+# Register workers
+# -------------------------------------------------------------
 if [ ${#discovered_workers[@]} -eq 0 ]; then
     echo ""
-    echo "⚠ WARNING: No worker services discovered!"
-    echo "Expected worker services like: worker1, worker2, etc."
-    echo "Make sure worker services are deployed and accessible on the private network."
+    echo "⚠ WARNING: No workers discovered!"
+    echo "Ensure worker services exist: worker1, worker2, etc."
     echo ""
 else
     echo ""
-    echo "Found ${#discovered_workers[@]} worker service(s)"
+    echo "Found ${#discovered_workers[@]} worker(s)."
     echo ""
-    
-    # Register each discovered worker
+
     for worker in "${discovered_workers[@]}"; do
         if wait_for_worker "$worker"; then
-            register_worker "$worker" 5432
+            register_worker "$worker"
         else
-            echo "⚠ Skipping $worker (not responding)"
+            echo "⚠ Skipping $worker (never became ready)"
         fi
     done
 fi
 
+
+# -------------------------------------------------------------
+# Verify cluster
+# -------------------------------------------------------------
 echo ""
 echo "========================================="
 echo "Verifying Citus Cluster Configuration"
 echo "========================================="
 
-# Verify cluster setup
-PGPASSWORD=$POSTGRES_PASSWORD psql -h "$COORDINATOR_HOST" -U "$POSTGRES_USER" -d postgres <<-EOSQL
+PGPASSWORD=$POSTGRES_PASSWORD psql \
+    -h "$COORDINATOR_HOST" -U "$POSTGRES_USER" -d postgres <<-EOSQL
     SELECT 
         nodename AS "Node",
         nodeport AS "Port",
@@ -180,9 +214,9 @@ PGPASSWORD=$POSTGRES_PASSWORD psql -h "$COORDINATOR_HOST" -U "$POSTGRES_USER" -d
     ORDER BY nodename;
 EOSQL
 
-# Count registered workers
-WORKER_COUNT=$(PGPASSWORD=$POSTGRES_PASSWORD psql -h "$COORDINATOR_HOST" -U "$POSTGRES_USER" -d postgres -tA -c \
-    "SELECT COUNT(*) FROM pg_dist_node WHERE noderole = 'primary' AND groupid > 0;")
+WORKER_COUNT=$(PGPASSWORD=$POSTGRES_PASSWORD psql \
+    -h "$COORDINATOR_HOST" -U "$POSTGRES_USER" -d postgres -tA -c \
+    "SELECT COUNT(*) FROM pg_dist_node WHERE groupid > 0;" || echo "0")
 
 echo ""
 echo "========================================="
@@ -194,15 +228,8 @@ echo ""
 
 if [ "$WORKER_COUNT" -gt 0 ]; then
     echo "✓ Citus cluster is ready!"
-    echo ""
-    echo "Next steps:"
-    echo "1. Connect to coordinator: psql \$DATABASE_URL"
-    echo "2. Create a distributed table:"
-    echo "   SELECT create_distributed_table('your_table', 'distribution_column');"
-    echo ""
 else
-    echo "⚠ No workers registered. Cluster is running but not distributed."
-    echo "Check that worker services are running and accessible."
+    echo "⚠ No workers registered. Cluster runs as single node."
 fi
 
 echo "========================================="
