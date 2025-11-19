@@ -33,28 +33,33 @@ wait_for_worker() {
     local max_attempts=30
     local attempt=0
     
-    echo "Waiting for $worker_host to be ready..."
-    until nc -z -w5 "$worker_host" 5432 2>/dev/null; do
+    # Always append .railway.internal for Railway's private network
+    local full_host="${worker_host}.railway.internal"
+    
+    echo "Waiting for $full_host to be ready..."
+    
+    # Test with netcat first
+    until nc -z -w5 "$full_host" 5432 2>/dev/null; do
         attempt=$((attempt + 1))
         if [ $attempt -ge $max_attempts ]; then
-            echo "✗ Timeout waiting for $worker_host"
+            echo "✗ Timeout waiting for $full_host"
             return 1
         fi
-        echo "  $worker_host not ready yet (attempt $attempt/$max_attempts)..."
+        echo "  $full_host not ready yet (attempt $attempt/$max_attempts)..."
         sleep 5
     done
     
     # Additional check with psql
-    until PGPASSWORD=$POSTGRES_PASSWORD psql -h "$worker_host" -U "$POSTGRES_USER" -d postgres -c '\q' 2>/dev/null; do
+    until PGPASSWORD=$POSTGRES_PASSWORD psql -h "$full_host" -U "$POSTGRES_USER" -d postgres -c '\q' 2>/dev/null; do
         attempt=$((attempt + 1))
         if [ $attempt -ge $max_attempts ]; then
-            echo "✗ Timeout waiting for $worker_host PostgreSQL"
+            echo "✗ Timeout waiting for $full_host PostgreSQL"
             return 1
         fi
         sleep 2
     done
     
-    echo "✓ $worker_host is ready"
+    echo "✓ $full_host is ready"
     return 0
 }
 
@@ -63,25 +68,28 @@ register_worker() {
     local worker_host=$1
     local worker_port=${2:-5432}
     
+    # Always use .railway.internal suffix for Railway
+    local full_host="${worker_host}.railway.internal"
+    
     echo ""
-    echo "Registering worker: $worker_host:$worker_port"
+    echo "Registering worker: $full_host:$worker_port"
     
     # Check if worker is already registered
     local existing=$(PGPASSWORD=$POSTGRES_PASSWORD psql -h "$COORDINATOR_HOST" -U "$POSTGRES_USER" -d postgres -tA -c \
-        "SELECT COUNT(*) FROM pg_dist_node WHERE nodename = '$worker_host' AND nodeport = $worker_port;")
+        "SELECT COUNT(*) FROM pg_dist_node WHERE nodename = '$full_host' AND nodeport = $worker_port;")
     
     if [ "$existing" != "0" ]; then
-        echo "✓ Worker $worker_host already registered, skipping"
+        echo "✓ Worker $full_host already registered, skipping"
         return 0
     fi
     
     # Register the worker
     if PGPASSWORD=$POSTGRES_PASSWORD psql -h "$COORDINATOR_HOST" -U "$POSTGRES_USER" -d postgres -c \
-        "SELECT * FROM citus_add_node('$worker_host', $worker_port);" >/dev/null 2>&1; then
-        echo "✓ Successfully registered worker: $worker_host"
+        "SELECT * FROM citus_add_node('$full_host', $worker_port);" >/dev/null 2>&1; then
+        echo "✓ Successfully registered worker: $full_host"
         return 0
     else
-        echo "✗ Failed to register worker: $worker_host"
+        echo "✗ Failed to register worker: $full_host"
         return 1
     fi
 }
@@ -98,58 +106,39 @@ discovered_workers=()
 # Method 1: Try common worker names (worker1-20)
 echo "Scanning for worker services..."
 echo "DEBUG: Testing DNS resolution for worker services..."
+
 for i in {1..20}; do
     worker_name="worker$i"
     
-    # Verbose DNS check
+    # Check both formats: with and without .railway.internal
     echo "  Checking: $worker_name"
-    if host "$worker_name" 2>&1; then
-        echo "✓ Discovered: $worker_name (DNS resolved)"
-        discovered_workers+=("$worker_name")
-    else
-        echo "  ✗ $worker_name - DNS lookup failed"
-    fi
-done
-
-echo ""
-echo "DEBUG: Also checking Railway internal DNS format..."
-for i in {1..20}; do
-    worker_name="worker$i.railway.internal"
     
-    echo "  Checking: $worker_name"
-    if host "$worker_name" 2>&1; then
-        # Strip .railway.internal for connection
-        clean_name="worker$i"
-        if [[ ! " ${discovered_workers[@]} " =~ " ${clean_name} " ]]; then
-            echo "✓ Discovered: $clean_name (via .railway.internal)"
-            discovered_workers+=("$clean_name")
-        fi
+    # Try with .railway.internal first (more reliable on Railway)
+    if getent hosts "${worker_name}.railway.internal" >/dev/null 2>&1; then
+        echo "✓ Discovered: $worker_name (via getent hosts)"
+        discovered_workers+=("$worker_name")
+        continue
+    fi
+    
+    # Try without suffix
+    if getent hosts "$worker_name" >/dev/null 2>&1; then
+        echo "✓ Discovered: $worker_name (direct)"
+        discovered_workers+=("$worker_name")
+        continue
+    fi
+    
+    # Fallback: Try parsing host output even if exit code is non-zero
+    # Railway DNS sometimes returns addresses but with NOTIMP error code
+    host_output=$(host "${worker_name}.railway.internal" 2>&1)
+    if echo "$host_output" | grep -q "has address\|has IPv6 address"; then
+        echo "✓ Discovered: $worker_name (via host command with address)"
+        discovered_workers+=("$worker_name")
+        continue
     fi
 done
 
 echo ""
-echo "DEBUG: Checking Railway environment variables..."
-env | grep -i railway | grep -i worker || echo "  No Railway worker variables found"
-
-echo ""
-echo "DEBUG: Attempting to list all resolvable hosts in private network..."
-# This might reveal the actual hostname format Railway is using
-getent hosts | grep -i worker || echo "  No worker hosts found in DNS"
-
-# Method 2: Also check for workers with different naming patterns
-# (e.g., worker-1, citus-worker-1, etc.)
-for pattern in "worker-" "citus-worker" "citus-worker-"; do
-    for i in {1..20}; do
-        worker_name="${pattern}${i}"
-        if host "$worker_name" >/dev/null 2>&1; then
-            # Check if not already in array
-            if [[ ! " ${discovered_workers[@]} " =~ " ${worker_name} " ]]; then
-                echo "✓ Discovered: $worker_name"
-                discovered_workers+=("$worker_name")
-            fi
-        fi
-    done
-done
+echo "DEBUG: Discovered workers array: ${discovered_workers[@]}"
 
 # Register all discovered workers
 if [ ${#discovered_workers[@]} -eq 0 ]; then
